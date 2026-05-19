@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Output files
+output_*
+result_*
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
