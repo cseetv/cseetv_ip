@@ -82,6 +82,12 @@ class Pipeline:
         self.frame_count += 1
         steps_applied = []
 
+        # ⓪ 해상도 표준화 (모든 프레임을 동일 크기로)
+        TARGET_W, TARGET_H = 640, 480
+        h_orig, w_orig = frame.shape[:2]
+        if w_orig != TARGET_W or h_orig != TARGET_H:
+            frame = cv2.resize(frame, (TARGET_W, TARGET_H))
+
         # ① 밝기 보정
         adjusted, brightness_info = adjust_brightness(
             frame, s.target_brightness, s.clahe_clip_limit, s.clahe_tile_size
@@ -121,7 +127,7 @@ class Pipeline:
             "risk_level": "safe",
         }
 
-        if self.prev_gray is not None:
+        if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
             # 동적 임계값
             curr_brightness = quality_stats.get("brightness_after", 120.0)
 
