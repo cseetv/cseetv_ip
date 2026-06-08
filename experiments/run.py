@@ -228,6 +228,7 @@ def exp_filters(frames, gt_masks, gt_binary, T=25):
 def exp_threshold(frames, gt_masks, gt_binary):
     print("\n" + "=" * 60)
     print("실험 3: 임계값 최적화 (표 6)")
+    print("  ※ Ablation 결과 기반 최적 설정: Morphology ON, Shadow OFF")
     print("=" * 60)
 
     Ts = [10, 15, 20, 25, 30, 35, 40, 50]
@@ -235,7 +236,10 @@ def exp_threshold(frames, gt_masks, gt_binary):
 
     for t in Ts:
         print(f"\n  T={t}...")
-        r = run_pipeline(frames, gt_masks, threshold=t)
+        r = run_pipeline(frames, gt_masks, threshold=t,
+                         use_clahe=True, use_denoise=True,
+                         use_gaussian=True, use_median=True,
+                         use_morph=True, use_shadow=False)  # ← Shadow OFF
         fm = calc_detection_metrics(r["detections"], gt_binary)
         rows.append({
             "threshold": t,
