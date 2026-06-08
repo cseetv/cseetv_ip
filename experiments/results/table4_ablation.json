@@ -1,0 +1,72 @@
+[
+  {
+    "step": 0,
+    "name": "Baseline (Frame Diff만)",
+    "mu": 90.5,
+    "sigma": 47.7,
+    "precision": 0.6532,
+    "recall": 0.9919,
+    "f1": 0.7877,
+    "delta_f1": 0.7877,
+    "fp": 454,
+    "delta_fp": 454,
+    "fn": 7,
+    "time_ms": 7.4
+  },
+  {
+    "step": 1,
+    "name": "+ CLAHE",
+    "mu": 108.6,
+    "sigma": 47.8,
+    "precision": 0.6548,
+    "recall": 0.9988,
+    "f1": 0.791,
+    "delta_f1": 0.0033,
+    "fp": 454,
+    "delta_fp": 0,
+    "fn": 1,
+    "time_ms": 9.9
+  },
+  {
+    "step": 2,
+    "name": "+ Gaussian + Median",
+    "mu": 107.9,
+    "sigma": 46.3,
+    "precision": 0.6568,
+    "recall": 0.9988,
+    "f1": 0.7925,
+    "delta_f1": 0.0015,
+    "fp": 450,
+    "delta_fp": -4,
+    "fn": 1,
+    "time_ms": 601.7
+  },
+  {
+    "step": 3,
+    "name": "+ Morphology",
+    "mu": 107.9,
+    "sigma": 46.3,
+    "precision": 0.6538,
+    "recall": 0.9988,
+    "f1": 0.7903,
+    "delta_f1": -0.0022,
+    "fp": 456,
+    "delta_fp": 6,
+    "fn": 1,
+    "time_ms": 668.8
+  },
+  {
+    "step": 4,
+    "name": "+ Shadow Removal",
+    "mu": 107.9,
+    "sigma": 46.3,
+    "precision": 0.6567,
+    "recall": 0.9385,
+    "f1": 0.7727,
+    "delta_f1": -0.0176,
+    "fp": 423,
+    "delta_fp": -33,
+    "fn": 53,
+    "time_ms": 3510.1
+  }
+]
