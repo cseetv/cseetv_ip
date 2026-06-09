@@ -1,6 +1,10 @@
 """cseetv 설정값 관리"""
 
+import os
+from dotenv import load_dotenv
 from pydantic import BaseModel
+
+load_dotenv()
 
 
 class ProcessingSettings(BaseModel):
@@ -66,3 +70,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "https://cseetv-fe.vercel.app",
 ]
+
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "")
+VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:admin@example.com")

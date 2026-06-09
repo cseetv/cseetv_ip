@@ -3,8 +3,12 @@
 import os
 import uuid
 import json
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from ..config import settings
+from typing import Any
+
+from fastapi import APIRouter, UploadFile, File, HTTPException, Body
+from pywebpush import webpush, WebPushException
+
+from ..config import settings, VAPID_PRIVATE_KEY, VAPID_PUBLIC_KEY, VAPID_SUBJECT
 from ..utils.video_io import get_video_info
 
 router = APIRouter(prefix="/api")
@@ -15,7 +19,7 @@ RESULTS_DIR = "results"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# 알림 저장소 (메모리)
+push_subscriptions: list[dict[str, Any]] = []
 alerts_store: list = []
 
 
@@ -42,6 +46,53 @@ async def upload_video(file: UploadFile = File(...)):
         "path": save_path,
         **info,
     }
+
+
+@router.post("/push/subscribe")
+async def subscribe_push(subscription: dict[str, Any] = Body(...)):
+    """웹 푸시 구독 정보 저장"""
+    if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
+        raise HTTPException(status_code=500, detail="VAPID 키가 설정되지 않았습니다.")
+
+    if subscription not in push_subscriptions:
+        push_subscriptions.append(subscription)
+    return {"ok": True, "vapidPublicKey": VAPID_PUBLIC_KEY}
+
+
+@router.post("/push/send")
+async def send_push(message: dict[str, Any] = Body(...)):
+    """등록된 구독자에게 푸시 전송"""
+    if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
+        raise HTTPException(status_code=500, detail="VAPID 키가 설정되지 않았습니다.")
+
+    payload = {
+        "title": message.get("title", "cseetv 알림"),
+        "body": message.get("body", "위험이 감지되었습니다."),
+    }
+
+    results = []
+    for sub in list(push_subscriptions):
+        try:
+            webpush(
+                subscription_info=sub,
+                data=json.dumps(payload),
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_SUBJECT},
+            )
+            results.append({"subscription": sub, "status": "ok"})
+        except WebPushException as exc:
+            results.append({"subscription": sub, "status": "error", "detail": str(exc)})
+            if exc.response and exc.response.status_code == 410:
+                push_subscriptions.remove(sub)
+    return {"ok": True, "result": results}
+
+
+@router.get("/push/public_key")
+async def get_push_public_key():
+    """웹 푸시 구독에 사용할 공개 VAPID 키 반환"""
+    if not VAPID_PUBLIC_KEY:
+        raise HTTPException(status_code=500, detail="VAPID 공개 키가 설정되지 않았습니다.")
+    return {"vapidPublicKey": VAPID_PUBLIC_KEY}
 
 
 @router.get("/videos")
