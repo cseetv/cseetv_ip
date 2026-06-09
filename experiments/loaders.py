@@ -61,7 +61,7 @@ def load_cdnet(
     temporal_path = os.path.join(dataset_dir, "temporalROI.txt")
     eval_start, eval_end = 1, len(input_files)
     if os.path.exists(temporal_path):
-        with open(temporal_path) as f:
+        with open(temporal_path, encoding="utf-8", errors="ignore") as f:
             parts = f.read().strip().split()
             if len(parts) >= 2:
                 eval_start, eval_end = int(parts[0]), int(parts[1])

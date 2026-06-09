@@ -253,6 +253,191 @@ def exp_threshold(frames, gt_masks, gt_binary):
     return rows
 
 
+# ═══ 추가 기법 파이프라인 ═══
+
+def run_advanced_pipeline(
+    frames, gt_masks=None,
+    method="frame_diff",  # frame_diff | running_avg | three_frame | mog2
+    use_clahe=True, use_gaussian=True,
+    use_morph=True, use_otsu=False,
+    threshold=20, min_area=200, avg_alpha=0.05,
+) -> Dict:
+    """
+    추가 기법을 적용한 파이프라인.
+    - running_avg: 가중평균 배경 모델 (cv2.accumulateWeighted)
+    - three_frame: 3프레임 차분 (AND 연산)
+    - mog2: OpenCV 배경 차분 (가우시안 혼합 모델)
+    - use_otsu: Otsu 자동 임계값
+    """
+    detections = []
+    prev_gray, prev2_gray, prev_bgr = None, None, None
+    bg_model = None      # Running Average 배경
+    mog2 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True) if method == "mog2" else None
+    mu_list, sigma_list = [], []
+    pixel_tp, pixel_fp, pixel_fn, pixel_tn = 0, 0, 0, 0
+    t0 = time.time()
+
+    for i, frame in enumerate(frames):
+        # 전처리: CLAHE + Gaussian (fastNlMeans 제외 = 속도 최적화)
+        if use_clahe:
+            frame, _ = adjust_brightness(frame, target_brightness=120, clahe_clip=2.0, clahe_tile=8)
+        if use_gaussian:
+            frame = cv2.GaussianBlur(frame, (5, 5), 0)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        q = calc_quality_metrics(gray)
+        mu_list.append(q["mean"])
+        sigma_list.append(q["std"])
+
+        detected = False
+        binary_mask = np.zeros_like(gray)
+
+        if method == "mog2":
+            # ── MOG2 배경 차분 ──
+            fg_mask = mog2.apply(frame)
+            # 그림자(127) 제거, 전경(255)만
+            binary_mask = np.where(fg_mask == 255, 255, 0).astype(np.uint8)
+            if use_morph:
+                kernel = np.ones((5, 5), np.uint8)
+                binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+                binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
+            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            detected = any(cv2.contourArea(c) >= min_area for c in contours)
+
+        elif method == "running_avg":
+            # ── Running Average 배경 모델 ──
+            gray_f = gray.astype(np.float32)
+            if bg_model is None:
+                bg_model = gray_f.copy()
+            else:
+                cv2.accumulateWeighted(gray_f, bg_model, avg_alpha)
+                diff = cv2.absdiff(gray, bg_model.astype(np.uint8))
+                if use_otsu:
+                    _, binary_mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                else:
+                    _, binary_mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+                if use_morph:
+                    kernel = np.ones((5, 5), np.uint8)
+                    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+                    binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
+                contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                detected = any(cv2.contourArea(c) >= min_area for c in contours)
+
+        elif method == "three_frame":
+            # ── 3-Frame Difference ──
+            if prev_gray is not None and prev2_gray is not None:
+                diff1 = cv2.absdiff(prev_gray, gray)
+                diff2 = cv2.absdiff(prev2_gray, prev_gray)
+                if use_otsu:
+                    _, b1 = cv2.threshold(diff1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    _, b2 = cv2.threshold(diff2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                else:
+                    _, b1 = cv2.threshold(diff1, threshold, 255, cv2.THRESH_BINARY)
+                    _, b2 = cv2.threshold(diff2, threshold, 255, cv2.THRESH_BINARY)
+                binary_mask = cv2.bitwise_and(b1, b2)
+                if use_morph:
+                    kernel = np.ones((5, 5), np.uint8)
+                    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+                    binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
+                contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                detected = any(cv2.contourArea(c) >= min_area for c in contours)
+
+        else:
+            # ── 기존 Frame Difference ──
+            if prev_gray is not None and prev_gray.shape == gray.shape:
+                result = detect_motion(prev_gray, gray,
+                    threshold_value=threshold, min_area=min_area,
+                    morph_kernel_size=5 if use_morph else 1,
+                    dilate_iterations=2 if use_morph else 0)
+                detected = result["detected"]
+                binary_mask = result["binary_mask"]
+
+        detections.append(detected)
+
+        # 픽셀 평가
+        if gt_masks and i < len(gt_masks) and gt_masks[i] is not None:
+            gt_m = gt_masks[i]
+            bm = binary_mask
+            if bm.shape != gt_m.shape:
+                bm = cv2.resize(bm, (gt_m.shape[1], gt_m.shape[0]))
+            from experiments.loaders import evaluate_cdnet_pixel
+            px = evaluate_cdnet_pixel(bm, gt_m)
+            pixel_tp += px["tp"]; pixel_fp += px["fp"]
+            pixel_fn += px["fn"]; pixel_tn += px["tn"]
+
+        prev2_gray = prev_gray.copy() if prev_gray is not None else None
+        prev_gray = gray.copy()
+        prev_bgr = frame.copy()
+
+        if (i + 1) % 500 == 0:
+            print(f"    {i+1}/{len(frames)} ({(i+1)/len(frames)*100:.0f}%)")
+
+    elapsed = time.time() - t0
+    px_p = pixel_tp / max(pixel_tp + pixel_fp, 1)
+    px_r = pixel_tp / max(pixel_tp + pixel_fn, 1)
+    px_f1 = 2 * px_p * px_r / max(px_p + px_r, 1e-10)
+
+    return {
+        "detections": detections,
+        "px_precision": round(px_p, 4), "px_recall": round(px_r, 4), "px_f1": round(px_f1, 4),
+        "time_ms": round(elapsed / max(len(frames), 1) * 1000, 1),
+        "mu": round(np.mean(mu_list), 1) if mu_list else 0,
+        "sigma": round(np.mean(sigma_list), 1) if sigma_list else 0,
+    }
+
+
+# ═══ 실험 4: 추가 기법 비교 (에러 분석 → 개선) ═══
+
+def exp_advanced(frames, gt_masks, gt_binary, T=20):
+    print("\n" + "=" * 60)
+    print("실험 4: 추가 기법 비교 (에러 분석 기반 개선)")
+    print("  FP 원인 → Running Avg, 3-Frame Diff")
+    print("  T 자동화 → Otsu")
+    print("  AI 비교 → MOG2")
+    print("=" * 60)
+
+    configs = [
+        ("기존 최적 (Frame Diff + Morph)", dict(method="frame_diff", use_otsu=False)),
+        ("+ Otsu 자동 임계값", dict(method="frame_diff", use_otsu=True)),
+        ("3-Frame Difference", dict(method="three_frame", use_otsu=False)),
+        ("3-Frame Diff + Otsu", dict(method="three_frame", use_otsu=True)),
+        ("Running Average BG", dict(method="running_avg", use_otsu=False)),
+        ("Running Avg + Otsu", dict(method="running_avg", use_otsu=True)),
+        ("--- AI 비교: MOG2 ---", dict(method="mog2")),
+    ]
+
+    rows = []
+    base_f1 = 0
+
+    for name, cfg in configs:
+        print(f"\n  {name}...")
+        r = run_advanced_pipeline(frames, gt_masks, threshold=T,
+                                   use_clahe=True, use_gaussian=True, use_morph=True, **cfg)
+        fm = calc_detection_metrics(r["detections"], gt_binary)
+
+        if not base_f1:
+            base_f1 = r["px_f1"]
+        delta = round(r["px_f1"] - base_f1, 4)
+
+        rows.append({
+            "name": name,
+            "px_prec": r["px_precision"], "px_rec": r["px_recall"], "px_f1": r["px_f1"],
+            "delta_f1": f"{delta:+.4f}" if base_f1 else "baseline",
+            "frame_f1": fm["f1"],
+            "time_ms": r["time_ms"],
+        })
+        print(f"      [픽셀] P={r['px_precision']:.3f} R={r['px_recall']:.3f} "
+              f"F1={r['px_f1']:.3f} (Δ={delta:+.3f}) time={r['time_ms']:.1f}ms")
+
+    best_trad = max([r for r in rows if "MOG2" not in r["name"]], key=lambda x: x["px_f1"])
+    mog2_row = next((r for r in rows if "MOG2" in r["name"]), None)
+    print(f"\n  ★ 전통 기법 최적: {best_trad['name']} (F1={best_trad['px_f1']:.3f})")
+    if mog2_row:
+        print(f"  ★ AI 비교 (MOG2): F1={mog2_row['px_f1']:.3f}")
+
+    return rows
+
+
 # ═══ 저장 ═══
 
 def save_csv(data, path):
@@ -270,7 +455,7 @@ def save_csv(data, path):
 def main():
     p = argparse.ArgumentParser(description="cseetv 통합 실험 실행기")
     p.add_argument("--source", choices=["cdnet", "video"], required=True)
-    p.add_argument("--mode", choices=["ablation", "filters", "threshold", "all"], default="all")
+    p.add_argument("--mode", choices=["ablation", "filters", "threshold", "advanced", "all"], default="all")
 
     # CDnet 옵션
     p.add_argument("--data", default="data/tramStation", help="CDnet 데이터셋 폴더")
@@ -322,6 +507,10 @@ def main():
     if args.mode in ("threshold", "all"):
         r = exp_threshold(frames, gt_masks, gt_binary)
         save_csv(r, os.path.join(args.output, f"table6_threshold_{tag}.csv"))
+
+    if args.mode in ("advanced", "all"):
+        r = exp_advanced(frames, gt_masks, gt_binary, args.threshold)
+        save_csv(r, os.path.join(args.output, f"table7_advanced_{tag}.csv"))
 
     print("\n" + "=" * 60)
     print(f"완료! → {args.output}/")
