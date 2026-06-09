@@ -257,28 +257,27 @@ def exp_threshold(frames, gt_masks, gt_binary):
 
 def run_advanced_pipeline(
     frames, gt_masks=None,
-    method="frame_diff",  # frame_diff | running_avg | three_frame | mog2
+    method="frame_diff",  # frame_diff | running_avg | three_frame | mog2 | canny_diff
     use_clahe=True, use_gaussian=True,
     use_morph=True, use_otsu=False,
     threshold=20, min_area=200, avg_alpha=0.05,
+    morph_kernel=5,          # Morphology 커널 크기 (5, 7, 9)
+    roi_mask=None,           # CDnet ROI 마스크 (ndarray)
+    temporal_voting=0,       # 연속 N프레임 중 과반 감지 시 진짜 (0=미사용)
+    shape_filter=False,      # Contour 가로세로 비율 필터링
 ) -> Dict:
-    """
-    추가 기법을 적용한 파이프라인.
-    - running_avg: 가중평균 배경 모델 (cv2.accumulateWeighted)
-    - three_frame: 3프레임 차분 (AND 연산)
-    - mog2: OpenCV 배경 차분 (가우시안 혼합 모델)
-    - use_otsu: Otsu 자동 임계값
-    """
     detections = []
     prev_gray, prev2_gray, prev_bgr = None, None, None
-    bg_model = None      # Running Average 배경
+    bg_model = None
     mog2 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True) if method == "mog2" else None
     mu_list, sigma_list = [], []
     pixel_tp, pixel_fp, pixel_fn, pixel_tn = 0, 0, 0, 0
+    recent_detections = []  # Temporal Voting 버퍼
     t0 = time.time()
 
+    kernel = np.ones((morph_kernel, morph_kernel), np.uint8)
+
     for i, frame in enumerate(frames):
-        # 전처리: CLAHE + Gaussian (fastNlMeans 제외 = 속도 최적화)
         if use_clahe:
             frame, _ = adjust_brightness(frame, target_brightness=120, clahe_clip=2.0, clahe_tile=8)
         if use_gaussian:
@@ -286,71 +285,97 @@ def run_advanced_pipeline(
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         q = calc_quality_metrics(gray)
-        mu_list.append(q["mean"])
-        sigma_list.append(q["std"])
+        mu_list.append(q["mean"]); sigma_list.append(q["std"])
 
         detected = False
         binary_mask = np.zeros_like(gray)
 
         if method == "mog2":
-            # ── MOG2 배경 차분 ──
-            fg_mask = mog2.apply(frame)
-            # 그림자(127) 제거, 전경(255)만
-            binary_mask = np.where(fg_mask == 255, 255, 0).astype(np.uint8)
+            fg = mog2.apply(frame)
+            binary_mask = np.where(fg == 255, 255, 0).astype(np.uint8)
             if use_morph:
-                kernel = np.ones((5, 5), np.uint8)
                 binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
                 binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
-            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            detected = any(cv2.contourArea(c) >= min_area for c in contours)
 
         elif method == "running_avg":
-            # ── Running Average 배경 모델 ──
-            gray_f = gray.astype(np.float32)
+            gf = gray.astype(np.float32)
             if bg_model is None:
-                bg_model = gray_f.copy()
+                bg_model = gf.copy()
             else:
-                cv2.accumulateWeighted(gray_f, bg_model, avg_alpha)
+                cv2.accumulateWeighted(gf, bg_model, avg_alpha)
                 diff = cv2.absdiff(gray, bg_model.astype(np.uint8))
                 if use_otsu:
                     _, binary_mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 else:
                     _, binary_mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
                 if use_morph:
-                    kernel = np.ones((5, 5), np.uint8)
                     binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
                     binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
-                contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                detected = any(cv2.contourArea(c) >= min_area for c in contours)
 
         elif method == "three_frame":
-            # ── 3-Frame Difference ──
             if prev_gray is not None and prev2_gray is not None:
-                diff1 = cv2.absdiff(prev_gray, gray)
-                diff2 = cv2.absdiff(prev2_gray, prev_gray)
-                if use_otsu:
-                    _, b1 = cv2.threshold(diff1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    _, b2 = cv2.threshold(diff2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                else:
-                    _, b1 = cv2.threshold(diff1, threshold, 255, cv2.THRESH_BINARY)
-                    _, b2 = cv2.threshold(diff2, threshold, 255, cv2.THRESH_BINARY)
+                d1 = cv2.absdiff(prev_gray, gray)
+                d2 = cv2.absdiff(prev2_gray, prev_gray)
+                _, b1 = cv2.threshold(d1, threshold, 255, cv2.THRESH_BINARY)
+                _, b2 = cv2.threshold(d2, threshold, 255, cv2.THRESH_BINARY)
                 binary_mask = cv2.bitwise_and(b1, b2)
                 if use_morph:
-                    kernel = np.ones((5, 5), np.uint8)
                     binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
                     binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
-                contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                detected = any(cv2.contourArea(c) >= min_area for c in contours)
 
-        else:
-            # ── 기존 Frame Difference ──
+        elif method == "canny_diff":
+            # Canny 에지 영상끼리 비교 — 조명 변화에 강건
+            edges = cv2.Canny(gray, 50, 150)
+            if prev_gray is not None:
+                prev_edges = cv2.Canny(prev_gray, 50, 150)
+                binary_mask = cv2.absdiff(edges, prev_edges)
+                if use_morph:
+                    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+                    binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
+
+        else:  # frame_diff
             if prev_gray is not None and prev_gray.shape == gray.shape:
                 result = detect_motion(prev_gray, gray,
                     threshold_value=threshold, min_area=min_area,
-                    morph_kernel_size=5 if use_morph else 1,
+                    morph_kernel_size=morph_kernel,
                     dilate_iterations=2 if use_morph else 0)
-                detected = result["detected"]
                 binary_mask = result["binary_mask"]
+
+        # ── CDnet ROI 적용 ──
+        if roi_mask is not None:
+            rm = roi_mask
+            if rm.shape != binary_mask.shape:
+                rm = cv2.resize(rm, (binary_mask.shape[1], binary_mask.shape[0]))
+            # ROI 마스크: 255=관심, 0=무시
+            _, rm_bin = cv2.threshold(rm, 127, 255, cv2.THRESH_BINARY)
+            binary_mask = cv2.bitwise_and(binary_mask, rm_bin)
+
+        # ── Contour 필터링 ──
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_contours = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < min_area:
+                continue
+            if shape_filter:
+                x, y, w, h = cv2.boundingRect(c)
+                aspect = h / max(w, 1)
+                # 사람은 세로가 긴 형태 (비율 1.2~5.0)
+                if aspect < 0.8 or aspect > 6.0:
+                    continue
+            valid_contours.append(c)
+
+        raw_detected = len(valid_contours) > 0
+
+        # ── Temporal Voting ──
+        if temporal_voting > 0:
+            recent_detections.append(raw_detected)
+            if len(recent_detections) > temporal_voting:
+                recent_detections.pop(0)
+            # 과반수 이상 감지 시 진짜
+            detected = sum(recent_detections) >= (temporal_voting // 2 + 1)
+        else:
+            detected = raw_detected
 
         detections.append(detected)
 
@@ -366,8 +391,7 @@ def run_advanced_pipeline(
             pixel_fn += px["fn"]; pixel_tn += px["tn"]
 
         prev2_gray = prev_gray.copy() if prev_gray is not None else None
-        prev_gray = gray.copy()
-        prev_bgr = frame.copy()
+        prev_gray = gray.copy(); prev_bgr = frame.copy()
 
         if (i + 1) % 500 == 0:
             print(f"    {i+1}/{len(frames)} ({(i+1)/len(frames)*100:.0f}%)")
@@ -381,29 +405,38 @@ def run_advanced_pipeline(
         "detections": detections,
         "px_precision": round(px_p, 4), "px_recall": round(px_r, 4), "px_f1": round(px_f1, 4),
         "time_ms": round(elapsed / max(len(frames), 1) * 1000, 1),
-        "mu": round(np.mean(mu_list), 1) if mu_list else 0,
-        "sigma": round(np.mean(sigma_list), 1) if sigma_list else 0,
+        "mu": round(np.mean(mu_list), 1), "sigma": round(np.mean(sigma_list), 1),
     }
 
 
 # ═══ 실험 4: 추가 기법 비교 (에러 분석 → 개선) ═══
 
-def exp_advanced(frames, gt_masks, gt_binary, T=20):
+def exp_advanced(frames, gt_masks, gt_binary, T=20, roi_mask=None):
     print("\n" + "=" * 60)
     print("실험 4: 추가 기법 비교 (에러 분석 기반 개선)")
-    print("  FP 원인 → Running Avg, 3-Frame Diff")
-    print("  T 자동화 → Otsu")
-    print("  AI 비교 → MOG2")
     print("=" * 60)
 
+    base = dict(method="running_avg", use_clahe=True, use_gaussian=True, use_morph=True)
+
     configs = [
-        ("기존 최적 (Frame Diff + Morph)", dict(method="frame_diff", use_otsu=False)),
-        ("+ Otsu 자동 임계값", dict(method="frame_diff", use_otsu=True)),
-        ("3-Frame Difference", dict(method="three_frame", use_otsu=False)),
-        ("3-Frame Diff + Otsu", dict(method="three_frame", use_otsu=True)),
-        ("Running Average BG", dict(method="running_avg", use_otsu=False)),
-        ("Running Avg + Otsu", dict(method="running_avg", use_otsu=True)),
-        ("--- AI 비교: MOG2 ---", dict(method="mog2")),
+        # 기준선
+        ("기존 최적 (Frame Diff)", dict(method="frame_diff")),
+        ("Running Average (이전 최적)", dict(**base)),
+
+        # Precision 개선 (FP 줄이기)
+        ("RunAvg + CDnet ROI", dict(**base, roi_mask=roi_mask)),
+        ("RunAvg + Temporal Voting(3)", dict(**base, temporal_voting=3)),
+        ("RunAvg + Shape Filter", dict(**base, shape_filter=True)),
+        ("RunAvg + Morph 7×7", dict(**base, morph_kernel=7)),
+        ("RunAvg + ROI + Temporal + Shape", dict(**base, roi_mask=roi_mask, temporal_voting=3, shape_filter=True)),
+
+        # 다른 감지 방식
+        ("Canny Edge Diff", dict(method="canny_diff")),
+        ("3-Frame Difference", dict(method="three_frame")),
+
+        # AI 비교
+        ("--- AI: MOG2 ---", dict(method="mog2")),
+        ("MOG2 + ROI", dict(method="mog2", roi_mask=roi_mask)),
     ]
 
     rows = []
@@ -411,8 +444,9 @@ def exp_advanced(frames, gt_masks, gt_binary, T=20):
 
     for name, cfg in configs:
         print(f"\n  {name}...")
-        r = run_advanced_pipeline(frames, gt_masks, threshold=T,
-                                   use_clahe=True, use_gaussian=True, use_morph=True, **cfg)
+        full_cfg = dict(use_clahe=True, use_gaussian=True, use_morph=True, threshold=T)
+        full_cfg.update(cfg)
+        r = run_advanced_pipeline(frames, gt_masks, **full_cfg)
         fm = calc_detection_metrics(r["detections"], gt_binary)
 
         if not base_f1:
@@ -422,18 +456,23 @@ def exp_advanced(frames, gt_masks, gt_binary, T=20):
         rows.append({
             "name": name,
             "px_prec": r["px_precision"], "px_rec": r["px_recall"], "px_f1": r["px_f1"],
-            "delta_f1": f"{delta:+.4f}" if base_f1 else "baseline",
-            "frame_f1": fm["f1"],
-            "time_ms": r["time_ms"],
+            "delta_f1": f"{delta:+.4f}",
+            "frame_f1": fm["f1"], "time_ms": r["time_ms"],
         })
-        print(f"      [픽셀] P={r['px_precision']:.3f} R={r['px_recall']:.3f} "
+        print(f"      P={r['px_precision']:.3f} R={r['px_recall']:.3f} "
               f"F1={r['px_f1']:.3f} (Δ={delta:+.3f}) time={r['time_ms']:.1f}ms")
 
-    best_trad = max([r for r in rows if "MOG2" not in r["name"]], key=lambda x: x["px_f1"])
-    mog2_row = next((r for r in rows if "MOG2" in r["name"]), None)
-    print(f"\n  ★ 전통 기법 최적: {best_trad['name']} (F1={best_trad['px_f1']:.3f})")
-    if mog2_row:
-        print(f"  ★ AI 비교 (MOG2): F1={mog2_row['px_f1']:.3f}")
+    # 요약
+    trad = [r for r in rows if "MOG2" not in r["name"]]
+    ai = [r for r in rows if "MOG2" in r["name"]]
+    best_t = max(trad, key=lambda x: x["px_f1"])
+    best_a = max(ai, key=lambda x: x["px_f1"]) if ai else None
+    print(f"\n  ★ 전통 기법 최적: {best_t['name']} (F1={best_t['px_f1']:.3f})")
+    if best_a:
+        print(f"  ★ AI 최적: {best_a['name']} (F1={best_a['px_f1']:.3f})")
+        gap = round(best_a['px_f1'] - best_t['px_f1'], 3)
+        pct = round(best_t['px_f1'] / max(best_a['px_f1'], 0.001) * 100, 1)
+        print(f"  ★ 차이: {gap} (전통 = AI의 {pct}%)")
 
     return rows
 
@@ -509,7 +548,8 @@ def main():
         save_csv(r, os.path.join(args.output, f"table6_threshold_{tag}.csv"))
 
     if args.mode in ("advanced", "all"):
-        r = exp_advanced(frames, gt_masks, gt_binary, args.threshold)
+        roi = data.get("roi_mask") if args.source == "cdnet" else None
+        r = exp_advanced(frames, gt_masks, gt_binary, args.threshold, roi_mask=roi)
         save_csv(r, os.path.join(args.output, f"table7_advanced_{tag}.csv"))
 
     print("\n" + "=" * 60)
