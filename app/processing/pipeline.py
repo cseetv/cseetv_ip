@@ -39,6 +39,12 @@ class Pipeline:
         self.roi_mask: Optional[np.ndarray] = None
         self.heatmap: Optional[np.ndarray] = None
         self.frame_count = 0
+        # Running Average 배경 모델
+        self.bg_model: Optional[np.ndarray] = None
+        # MOG2 배경 차분
+        self.mog2 = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=16, detectShadows=True
+        ) if settings.detection_method == "mog2" else None
 
     def update_settings(self, new_settings: dict):
         """프론트에서 실시간 설정 변경 시 호출"""
@@ -62,6 +68,10 @@ class Pipeline:
         self.roi_mask = None
         self.heatmap = None
         self.frame_count = 0
+        self.bg_model = None
+        if self.settings.detection_method == "mog2":
+            self.mog2 = cv2.createBackgroundSubtractorMOG2(
+                history=500, varThreshold=16, detectShadows=True)
         self.averager.reset()
         self.smoother.reset()
 
@@ -95,11 +105,12 @@ class Pipeline:
         steps_applied.append("clahe")
 
         # ② 노이즈 제거
+        nlm_h = s.denoise_h if s.use_fastNlMeans else 0
         denoised = denoise(
-            adjusted, s.denoise_h, s.use_gaussian, s.gaussian_kernel,
+            adjusted, nlm_h, s.use_gaussian, s.gaussian_kernel,
             s.use_median, s.median_kernel
         )
-        if s.denoise_h > 0:
+        if s.use_fastNlMeans and s.denoise_h > 0:
             steps_applied.append("fastNlMeans")
         if s.use_gaussian:
             steps_applied.append("gaussianBlur")
@@ -118,7 +129,7 @@ class Pipeline:
         quality_stats = self._calc_quality(gray)
         quality_stats.update(brightness_info)
 
-        # ⑤~⑨ 움직임 감지 (이전 프레임이 있을 때만)
+        # ⑤~⑨ 움직임 감지
         motion_result = {
             "detected": False,
             "boxes": [],
@@ -127,26 +138,62 @@ class Pipeline:
             "risk_level": "safe",
         }
 
-        if self.prev_gray is not None and self.prev_gray.shape == gray.shape:
+        method = s.detection_method
+        can_detect = (
+            method == "mog2" or
+            method == "running_avg" or
+            (self.prev_gray is not None and self.prev_gray.shape == gray.shape)
+        )
+
+        if can_detect:
             # 동적 임계값
             curr_brightness = quality_stats.get("brightness_after", 120.0)
+            binary_mask = np.zeros_like(gray)
+            method = s.detection_method
 
-            # Frame Difference + Morphology + Contour
-            raw_motion = detect_motion(
-                self.prev_gray, gray,
-                threshold_value=s.threshold_value,
-                use_adaptive=s.use_adaptive_threshold,
-                use_dynamic=s.use_dynamic_threshold,
-                dynamic_base=s.dynamic_base,
-                dynamic_factor=s.dynamic_factor,
-                brightness=curr_brightness,
-                min_area=s.min_motion_area,
-                morph_kernel_size=s.morph_kernel_size,
-                dilate_iterations=s.dilate_iterations,
-            )
-            steps_applied.extend(["frameDiff", "morphOpen", "dilate", "contourFilter"])
+            if method == "mog2" and self.mog2 is not None:
+                # ── MOG2 배경 차분 ──
+                fg = self.mog2.apply(denoised)
+                binary_mask = np.where(fg == 255, 255, 0).astype(np.uint8)
+                kernel = np.ones((s.morph_kernel_size, s.morph_kernel_size), np.uint8)
+                binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+                binary_mask = cv2.dilate(binary_mask, kernel, iterations=s.dilate_iterations)
+                steps_applied.extend(["mog2", "morphOpen", "dilate"])
 
-            binary_mask = raw_motion["binary_mask"]
+            elif method == "running_avg":
+                # ── Running Average 배경 모델 ──
+                gray_f = gray.astype(np.float32)
+                if self.bg_model is None:
+                    self.bg_model = gray_f.copy()
+                cv2.accumulateWeighted(gray_f, self.bg_model, s.running_avg_alpha)
+                diff = cv2.absdiff(gray, self.bg_model.astype(np.uint8))
+
+                if s.use_otsu:
+                    _, binary_mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                else:
+                    _, binary_mask = cv2.threshold(diff, s.threshold_value, 255, cv2.THRESH_BINARY)
+
+                kernel = np.ones((s.morph_kernel_size, s.morph_kernel_size), np.uint8)
+                binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+                binary_mask = cv2.dilate(binary_mask, kernel, iterations=s.dilate_iterations)
+                steps_applied.extend(["runningAvgBG", "morphOpen", "dilate"])
+
+            else:
+                # ── 기존 Frame Difference ──
+                raw_motion = detect_motion(
+                    self.prev_gray, gray,
+                    threshold_value=s.threshold_value,
+                    use_adaptive=s.use_adaptive_threshold,
+                    use_dynamic=s.use_dynamic_threshold,
+                    dynamic_base=s.dynamic_base,
+                    dynamic_factor=s.dynamic_factor,
+                    brightness=curr_brightness,
+                    min_area=s.min_motion_area,
+                    morph_kernel_size=s.morph_kernel_size,
+                    dilate_iterations=s.dilate_iterations,
+                )
+                binary_mask = raw_motion["binary_mask"]
+                steps_applied.extend(["frameDiff", "morphOpen", "dilate", "contourFilter"])
 
             # ⑦ Shadow Removal
             if s.use_shadow_removal and self.prev_bgr is not None:
